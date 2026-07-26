@@ -1,0 +1,1 @@
+# DOMjudge-Scoreboard-Archiver
