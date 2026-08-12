@@ -284,167 +284,11 @@ class BrowserHTMLArchiver:
             tag["style"] = self._inline_css(tag["style"], page_url)
 
     # ---------------------------------------------------------------------
-    # Universal offline AJAX/fetch cache
+    # Site-specific post-processing hook
     # ---------------------------------------------------------------------
-    def _inject_offline_ajax_cache(self, soup: BeautifulSoup, page_url: str) -> None:
-        """Prefetch all submission JSON data and team modal pages,
-        and inject them as a static cache to mock window.fetch and jQuery.ajax.
-        """
-        ajax_cache = {}
-        
-        # 1. Fetch submission data URLs
-        sub_tags = soup.find_all(attrs={"data-submissions-url": True})
-        sub_urls = sorted(list(set(tag.get("data-submissions-url") for tag in sub_tags if tag.get("data-submissions-url"))))
-        
-        if sub_urls:
-            print(f"Prefetching {len(sub_urls)} submissions data URLs...")
-            for sub_url in sub_urls:
-                abs_url = urljoin(page_url, sub_url)
-                try:
-                    r = requests.get(abs_url, headers=HEADERS, verify=self.verify_ssl, timeout=10)
-                    if r.status_code == 200:
-                        ajax_cache[sub_url] = r.text
-                    else:
-                        print(f"⚠️ Submissions endpoint {sub_url} returned status {r.status_code}")
-                except Exception as exc:
-                    print(f"⚠️ Error fetching submissions data {sub_url}: {exc}")
-        
-        # 2. Fetch team modal pages
-        team_tags = soup.find_all('a', attrs={"data-ajax-modal": True})
-        team_urls = sorted(list(set(tag.get("href") for tag in team_tags if tag.get("href"))))
-        
-        if team_urls:
-            print(f"Prefetching {len(team_urls)} team modal pages...")
-            for team_url in team_urls:
-                abs_url = urljoin(page_url, team_url)
-                try:
-                    headers = {**HEADERS, "X-Requested-With": "XMLHttpRequest"}
-                    r = requests.get(abs_url, headers=headers, verify=self.verify_ssl, timeout=10)
-                    if r.status_code == 200:
-                        modal_soup = BeautifulSoup(r.text, "html.parser")
-                        for s_tag in modal_soup.find_all("script"):
-                            s_tag.decompose()
-                        # Fetch and inline any images inside the modal HTML
-                        for img_tag in modal_soup.find_all("img", src=True):
-                            img_src = img_tag["src"]
-                            if img_src.lower().startswith("data:"):
-                                continue
-                            abs_img_url = urljoin(abs_url, img_src)
-                            try:
-                                r_img = requests.get(abs_img_url, headers=HEADERS, verify=self.verify_ssl, timeout=10)
-                                if r_img.status_code == 200:
-                                    mime, _ = mimetypes.guess_type(abs_img_url)
-                                    if not mime:
-                                        mime = "image/jpeg"
-                                    img_data = base64.b64encode(r_img.content).decode("utf-8")
-                                    img_tag["src"] = f"data:{mime};base64,{img_data}"
-                                else:
-                                    print(f"⚠️ Failed to fetch modal image {abs_img_url}: Status {r_img.status_code}")
-                            except Exception as exc:
-                                print(f"⚠️ Error fetching modal image {abs_img_url}: {exc}")
-                        # Extract only the main modal div (or root div) to avoid leading/trailing whitespace text nodes
-                        modal_div = modal_soup.find("div", class_="modal") or modal_soup.find("div")
-                        if modal_div:
-                            ajax_cache[team_url] = str(modal_div).strip()
-                        else:
-                            ajax_cache[team_url] = r.text.strip()
-                    else:
-                        print(f"⚠️ Team modal endpoint {team_url} returned status {r.status_code}")
-                except Exception as exc:
-                    print(f"⚠️ Error fetching team page {team_url}: {exc}")
-                    
-        # 3. Inject JS mockup script
-        if not ajax_cache:
-            return
-            
-        js_literal = json.dumps(ajax_cache).replace("</script", "<\\/script").replace("</SCRIPT", "<\\/SCRIPT")
-        js = f"""
-        (function() {{
-            const cache = {js_literal};
-            
-            // Normalize URLs (supporting relative, absolute path, and query matching)
-            function findCachedContent(url) {{
-                if (!url) return null;
-                // Stringify if it is a Request object
-                let urlStr = typeof url === 'string' ? url : url.url;
-                if (!urlStr) return null;
-                
-                // Try exact match
-                if (cache[urlStr]) return cache[urlStr];
-                
-                // Try matching paths or relative URLs
-                try {{
-                    const parsedUrl = new URL(urlStr, window.location.href);
-                    const pathAndQuery = parsedUrl.pathname + parsedUrl.search;
-                    if (cache[pathAndQuery]) return cache[pathAndQuery];
-                    
-                    // Try exact match with protocol/host stripped
-                    for (const key of Object.keys(cache)) {{
-                        if (urlStr.endsWith(key) || pathAndQuery.endsWith(key)) {{
-                            return cache[key];
-                        }}
-                    }}
-                }} catch(e) {{}}
-                
-                return null;
-            }}
-
-            // 1. Mock window.fetch
-            const originalFetch = window.fetch;
-            window.fetch = function(url, options) {{
-                const content = findCachedContent(url);
-                if (content !== null) {{
-                    return Promise.resolve(new Response(content, {{
-                        status: 200,
-                        headers: {{ 'Content-Type': 'application/json' }}
-                    }}));
-                }}
-                return originalFetch.apply(this, arguments);
-            }};
-
-            // 2. Mock jQuery.ajax if jQuery loads
-            function setupJQueryMock() {{
-                if (typeof jQuery !== 'undefined') {{
-                    const originalAjax = jQuery.ajax;
-                    jQuery.ajax = function(options) {{
-                        let url = options.url || options;
-                        const content = findCachedContent(url);
-                        if (content !== null) {{
-                            const mockXHR = {{
-                                status: 200,
-                                responseText: content,
-                                getResponseHeader: function(header) {{
-                                    return null;
-                                }},
-                                getAllResponseHeaders: function() {{
-                                    return "";
-                                }}
-                            }};
-                            let d = jQuery.Deferred();
-                            d.resolve(content, "success", mockXHR);
-                            if (options.success) {{
-                                options.success(content, "success", mockXHR);
-                            }}
-                            return d.promise();
-                        }}
-                        return originalAjax.apply(this, arguments);
-                    }};
-                    console.log("DOMjudge scoreboard offline AJAX cache initialized.");
-                }} else {{
-                    // Try again in 50ms if jQuery is still loading
-                    setTimeout(setupJQueryMock, 50);
-                }}
-            }}
-            setupJQueryMock();
-        }})();
-        """
-        
-        script = soup.new_tag("script")
-        script.string = js
-        if soup.body:
-            soup.body.append(script)
-        else:
-            soup.append(script)
+    def post_process_html(self, soup: BeautifulSoup, page_url: str) -> None:
+        """Hook for subclasses to apply site-specific post-processing to the serialized DOM."""
+        pass
 
     # ---------------------------------------------------------------------
     # Simple modal shim – identical to the previous version
@@ -738,7 +582,8 @@ class BrowserHTMLArchiver:
                 if href:
                     original_links.append(urljoin(page_url, href))
             log.write("CSS_ORDER|ORIGINAL|" + '|'.join(original_links) + "\n")
-            log.write("CSS_ORDER|INLINE|" + '|'.join(original_links) + "\n")
+            inlined_links = [url for url in original_links if url in self.assets]
+            log.write("CSS_ORDER|INLINE|" + '|'.join(inlined_links) + "\n")
         print(f"[V] Diagnostics written to {log_path}")
 
     # ---------------------------------------------------------------------
@@ -789,7 +634,7 @@ class BrowserHTMLArchiver:
         if self.generate_diagnostics:
             self._log_missing_css_assets(soup, final_url)
             self._log_icon_assets(soup, final_url)
-        self._inject_offline_ajax_cache(soup, final_url)
+        self.post_process_html(soup, final_url)
         # Conditionally inject modal shim and CSS fixups only if Bootstrap JS is missing
         if not self.bootstrap_js_present:
             self._inject_modal_helper(soup)
@@ -824,6 +669,450 @@ class BrowserHTMLArchiver:
                 self._compare_and_log_styles(live_data, offline_data)
                 browser.close()
 
+class DOMjudgeScoreboardArchiver(BrowserHTMLArchiver):
+    """Subclass of BrowserHTMLArchiver specialized for DOMjudge scoreboards,
+    adding submission dynamic caching and team category filter handling.
+    """
+    def post_process_html(self, soup: BeautifulSoup, page_url: str) -> None:
+        self._inject_offline_ajax_cache(soup, page_url)
+
+    def _inject_offline_ajax_cache(self, soup: BeautifulSoup, page_url: str) -> None:
+        """Prefetch all submission JSON data and team modal pages,
+        and inject them as a static cache to mock window.fetch and jQuery.ajax.
+        """
+        ajax_cache = {}
+        
+        # 1. Fetch submission data URLs
+        sub_tags = soup.find_all(attrs={"data-submissions-url": True})
+        sub_urls = sorted(list(set(tag.get("data-submissions-url") for tag in sub_tags if tag.get("data-submissions-url"))))
+        
+        if sub_urls:
+            print(f"Prefetching {len(sub_urls)} submissions data URLs...")
+            for sub_url in sub_urls:
+                abs_url = urljoin(page_url, sub_url)
+                try:
+                    r = requests.get(abs_url, headers=HEADERS, verify=self.verify_ssl, timeout=10)
+                    if r.status_code == 200:
+                        ajax_cache[sub_url] = r.text
+                    else:
+                        print(f"⚠️ Submissions endpoint {sub_url} returned status {r.status_code}")
+                except Exception as exc:
+                    print(f"⚠️ Error fetching submissions data {sub_url}: {exc}")
+        
+        # 2. Fetch team modal pages
+        team_tags = soup.find_all('a', attrs={"data-ajax-modal": True})
+        team_urls = sorted(list(set(tag.get("href") for tag in team_tags if tag.get("href"))))
+        
+        if team_urls:
+            print(f"Prefetching {len(team_urls)} team modal pages...")
+            for team_url in team_urls:
+                abs_url = urljoin(page_url, team_url)
+                try:
+                    headers = {**HEADERS, "X-Requested-With": "XMLHttpRequest"}
+                    r = requests.get(abs_url, headers=headers, verify=self.verify_ssl, timeout=10)
+                    if r.status_code == 200:
+                        modal_soup = BeautifulSoup(r.text, "html.parser")
+                        for s_tag in modal_soup.find_all("script"):
+                            s_tag.decompose()
+                        # Fetch and inline any images inside the modal HTML
+                        for img_tag in modal_soup.find_all("img", src=True):
+                            img_src = img_tag["src"]
+                            if img_src.lower().startswith("data:"):
+                                continue
+                            abs_img_url = urljoin(abs_url, img_src)
+                            try:
+                                r_img = requests.get(abs_img_url, headers=HEADERS, verify=self.verify_ssl, timeout=10)
+                                if r_img.status_code == 200:
+                                    mime, _ = mimetypes.guess_type(abs_img_url)
+                                    if not mime:
+                                        mime = "image/jpeg"
+                                    img_data = base64.b64encode(r_img.content).decode("utf-8")
+                                    img_tag["src"] = f"data:{mime};base64,{img_data}"
+                                else:
+                                    print(f"⚠️ Failed to fetch modal image {abs_img_url}: Status {r_img.status_code}")
+                            except Exception as exc:
+                                print(f"⚠️ Error fetching modal image {abs_img_url}: {exc}")
+                        # Extract only the main modal div (or root div) to avoid leading/trailing whitespace text nodes
+                        modal_div = modal_soup.find("div", class_="modal") or modal_soup.find("div")
+                        if modal_div:
+                            ajax_cache[team_url] = str(modal_div).strip()
+                        else:
+                            ajax_cache[team_url] = r.text.strip()
+                    else:
+                        print(f"⚠️ Team modal endpoint {team_url} returned status {r.status_code}")
+                except Exception as exc:
+                    print(f"⚠️ Error fetching team page {team_url}: {exc}")
+                    
+        # 3. Inject JS mockup script
+        if not ajax_cache:
+            return
+            
+        js_literal = json.dumps(ajax_cache).replace("</script", "<\\/script").replace("</SCRIPT", "<\\/SCRIPT")
+        js = f"""
+        (function() {{
+            const cache = {js_literal};
+            
+            // Normalize URLs (supporting relative, absolute path, and query matching)
+            function findCachedContent(url) {{
+                if (!url) return null;
+                // Stringify if it is a Request object
+                let urlStr = typeof url === 'string' ? url : url.url;
+                if (!urlStr) return null;
+                
+                // Try exact match
+                if (cache[urlStr]) return cache[urlStr];
+                
+                // Try matching paths or relative URLs
+                try {{
+                    const parsedUrl = new URL(urlStr, window.location.href);
+                    const pathAndQuery = parsedUrl.pathname + parsedUrl.search;
+                    if (cache[pathAndQuery]) return cache[pathAndQuery];
+                    
+                    // Try exact match with protocol/host stripped
+                    for (const key of Object.keys(cache)) {{
+                        if (urlStr.endsWith(key) || pathAndQuery.endsWith(key)) {{
+                            return cache[key];
+                        }}
+                    }}
+                }} catch(e) {{}}
+                
+                return null;
+            }}
+
+            // 1. Mock window.fetch
+            const originalFetch = window.fetch;
+            window.fetch = function(url, options) {{
+                const content = findCachedContent(url);
+                if (content !== null) {{
+                    return Promise.resolve(new Response(content, {{
+                        status: 200,
+                        headers: {{ 'Content-Type': 'application/json' }}
+                    }}));
+                }}
+                return originalFetch.apply(this, arguments);
+            }};
+
+            // 2. Mock jQuery.ajax if jQuery loads
+            function setupJQueryMock() {{
+                if (typeof jQuery !== 'undefined') {{
+                    const originalAjax = jQuery.ajax;
+                    jQuery.ajax = function(options) {{
+                        let url = options.url || options;
+                        const content = findCachedContent(url);
+                        if (content !== null) {{
+                            const mockXHR = {{
+                                status: 200,
+                                responseText: content,
+                                getResponseHeader: function(header) {{
+                                    return null;
+                                }},
+                                getAllResponseHeaders: function() {{
+                                    return "";
+                                }}
+                            }};
+                            let d = jQuery.Deferred();
+                            d.resolve(content, "success", mockXHR);
+                            if (options.success) {{
+                                options.success(content, "success", mockXHR);
+                            }}
+                            return d.promise();
+                        }}
+                        return originalAjax.apply(this, arguments);
+                    }};
+                    console.log("DOMjudge scoreboard offline AJAX cache initialized.");
+                }} else {{
+                    // Try again in 50ms if jQuery is still loading
+                    setTimeout(setupJQueryMock, 50);
+                }}
+            }}
+            setupJQueryMock();
+        }})();
+        """
+        
+        script = soup.new_tag("script")
+        script.string = js
+        if soup.body:
+            soup.body.append(script)
+        else:
+            soup.append(script)
+
+        # Set up the offline search/filter logic
+        self._setup_offline_filter(soup, page_url, ajax_cache)
+
+    def _setup_offline_filter(self, soup: BeautifulSoup, page_url: str, dynamic_team_pages: dict) -> None:
+        """Parse category/affiliation mappings for teams and inject the offline filter JS.
+        """
+        filter_options = {}
+        for select in soup.find_all("select"):
+            select_id = select.get("id")
+            if not select_id or "filter" not in select_id:
+                continue
+            filter_options[select_id] = {}
+            for option in select.find_all("option"):
+                val = option.get("value")
+                text = option.get_text(strip=True)
+                if val:
+                    filter_options[select_id][text] = val
+
+        team_filter_metadata = {}
+
+        def parse_modal_details(modal_soup):
+            cat_name = None
+            aff_name = None
+            for row in modal_soup.find_all("tr"):
+                th = row.find("th")
+                td = row.find("td")
+                if th and td:
+                    label = th.get_text(strip=True).lower()
+                    val = td.get_text(strip=True)
+                    if "category" in label or "類別" in label:
+                        cat_name = val
+                    elif "affiliation" in label or "機構" in label or "學校" in label:
+                        aff_name = val
+            return cat_name, aff_name
+
+        # 1. Extract from dynamically fetched team modal pages
+        for team_url, html_content in dynamic_team_pages.items():
+            match = re.search(r"/team/(\d+)", team_url)
+            if not match:
+                continue
+            team_id = match.group(1)
+            modal_soup = BeautifulSoup(html_content, "html.parser")
+            cat_name, aff_name = parse_modal_details(modal_soup)
+            
+            meta = {}
+            if cat_name and "scoreboard-filter-category" in filter_options:
+                opt_val = filter_options["scoreboard-filter-category"].get(cat_name)
+                if opt_val:
+                    meta["category"] = opt_val
+            if aff_name and "scoreboard-filter-affiliation" in filter_options:
+                opt_val = filter_options["scoreboard-filter-affiliation"].get(aff_name)
+                if opt_val:
+                    meta["affiliation"] = opt_val
+            if meta:
+                team_filter_metadata[team_id] = meta
+
+        # 2. Extract from statically inlined modals in the main HTML
+        for modal in soup.find_all(id=lambda x: x and x.startswith("team-modal-")):
+            modal_id = modal.get("id")
+            team_id = modal_id.split("-")[-1]
+            cat_name, aff_name = parse_modal_details(modal)
+            
+            meta = {}
+            if cat_name and "scoreboard-filter-category" in filter_options:
+                opt_val = filter_options["scoreboard-filter-category"].get(cat_name)
+                if opt_val:
+                    meta["category"] = opt_val
+            if aff_name and "scoreboard-filter-affiliation" in filter_options:
+                opt_val = filter_options["scoreboard-filter-affiliation"].get(aff_name)
+                if opt_val:
+                    meta["affiliation"] = opt_val
+            if meta:
+                if team_id not in team_filter_metadata:
+                    team_filter_metadata[team_id] = {}
+                team_filter_metadata[team_id].update(meta)
+
+        if team_filter_metadata or filter_options:
+            js = f"""
+            (function() {{
+                const teamFilterMetadata = {json.dumps(team_filter_metadata)};
+                
+                function updateScoreboardSummary() {{
+                    const scoreboardTables = document.querySelectorAll("table.scoreboard");
+                    scoreboardTables.forEach(scoreboardTable => {{
+                        const tbody = scoreboardTable.querySelector("tbody");
+                        if (!tbody) return;
+                        
+                        const rows = Array.from(tbody.querySelectorAll("tr")).filter(r => r.hasAttribute("data-team-id"));
+                        const visibleRows = rows.filter(r => r.style.display !== "none");
+                        
+                        const summaryRow = Array.from(tbody.querySelectorAll("tr")).find(r => r.querySelector(".scoresummary"));
+                        if (!summaryRow) return;
+                        
+                        const totalSolvedCell = summaryRow.querySelector(".scorenc");
+                        let globalTotalSolved = 0;
+                        visibleRows.forEach(row => {{
+                            const solvedCell = row.querySelector(".scorenc");
+                            if (solvedCell) {{
+                                globalTotalSolved += parseInt(solvedCell.textContent.trim()) || 0;
+                            }}
+                        }});
+                        if (totalSolvedCell) {{
+                            totalSolvedCell.textContent = globalTotalSolved;
+                        }}
+                        
+                        const firstTeamRow = rows[0];
+                        if (!firstTeamRow) return;
+                        
+                        const problemCellIndices = [];
+                        Array.from(firstTeamRow.cells).forEach((cell, idx) => {{
+                            if (cell.classList.contains("score_cell")) {{
+                                problemCellIndices.push(idx);
+                            }}
+                        }});
+                        
+                        const summaryCells = Array.from(summaryRow.cells);
+                        const numProblems = problemCellIndices.length;
+                        const summaryCellsCount = summaryCells.length;
+                        
+                        for (let p = 0; p < numProblems; p++) {{
+                            const summaryCell = summaryCells[summaryCellsCount - numProblems + p];
+                            const teamCellIndex = problemCellIndices[p];
+                            
+                            let accepted = 0;
+                            let rejected = 0;
+                            let pending = 0;
+                            let firstSolveTime = Infinity;
+                            
+                            visibleRows.forEach(row => {{
+                                const cell = row.cells[teamCellIndex];
+                                if (!cell) return;
+                                
+                                const correctDiv = cell.querySelector(".score_correct");
+                                if (correctDiv) {{
+                                    accepted += 1;
+                                    const span = correctDiv.querySelector("span");
+                                    if (span) {{
+                                        const triesMatch = span.textContent.match(/(\\d+)\\s+tr/);
+                                        if (triesMatch) {{
+                                            const totalTries = parseInt(triesMatch[1]) || 1;
+                                            rejected += (totalTries - 1);
+                                        }}
+                                    }}
+                                    let timeStr = "";
+                                    correctDiv.childNodes.forEach(node => {{
+                                        if (node.nodeType === Node.TEXT_NODE) {{
+                                            timeStr += node.textContent;
+                                        }}
+                                    }});
+                                    const time = parseInt(timeStr.trim());
+                                    if (!isNaN(time) && time < firstSolveTime) {{
+                                        firstSolveTime = time;
+                                    }}
+                                }} else {{
+                                    const incorrectDiv = cell.querySelector(".score_incorrect");
+                                    if (incorrectDiv) {{
+                                        const span = incorrectDiv.querySelector("span");
+                                        if (span) {{
+                                            const triesMatch = span.textContent.match(/(\\d+)\\s+tr/);
+                                            if (triesMatch) {{
+                                                rejected += parseInt(triesMatch[1]) || 0;
+                                            }}
+                                        }}
+                                    }} else {{
+                                        const pendingDiv = cell.querySelector(".score_pending");
+                                        if (pendingDiv) {{
+                                            const span = pendingDiv.querySelector("span");
+                                            if (span) {{
+                                                const triesMatch = span.textContent.match(/(\\d+)\\s+tr/);
+                                                if (triesMatch) {{
+                                                    pending += parseInt(triesMatch[1]) || 0;
+                                                }}
+                                            }}
+                                        }}
+                                    }}
+                                }}
+                            }});
+                            
+                            const correctSpan = summaryCell.querySelector(".submcorrect");
+                            const rejectSpan = summaryCell.querySelector(".submreject");
+                            const pendSpan = summaryCell.querySelector(".submpend");
+                            
+                            const anchor = summaryCell.querySelector("a");
+                            let timeSpan = null;
+                            if (anchor) {{
+                                const spans = anchor.querySelectorAll("span");
+                                if (spans.length >= 4) {{
+                                    timeSpan = spans[3];
+                                }} else {{
+                                    timeSpan = Array.from(spans).find(s => s.getAttribute("title") === "first solved" || s.textContent.includes("min") || s.textContent === "n/a");
+                                }}
+                            }}
+                            
+                            if (correctSpan) correctSpan.textContent = accepted;
+                            if (rejectSpan) rejectSpan.textContent = rejected;
+                            if (pendSpan) pendSpan.textContent = pending;
+                            
+                            if (timeSpan) {{
+                                if (accepted > 0 && firstSolveTime !== Infinity) {{
+                                    timeSpan.textContent = firstSolveTime + "min";
+                                }} else {{
+                                    timeSpan.textContent = "n/a";
+                                }}
+                            }}
+                        }}
+                    }});
+                }}
+
+                document.addEventListener("DOMContentLoaded", function() {{
+                    const filterForm = document.querySelector(".filterbox form") || document.querySelector("form");
+                    if (!filterForm) return;
+                    
+                    filterForm.addEventListener("submit", function(e) {{
+                        e.preventDefault();
+                        
+                        const submitter = e.submitter || document.activeElement;
+                        const isClear = submitter && submitter.value === "clear";
+                        
+                        const categorySelect = document.getElementById("scoreboard-filter-category");
+                        const affiliationSelect = document.getElementById("scoreboard-filter-affiliation");
+                        
+                        let selectedCategories = [];
+                        let selectedAffiliations = [];
+                        
+                        if (!isClear) {{
+                            if (categorySelect) {{
+                                selectedCategories = Array.from(categorySelect.selectedOptions).map(o => o.value);
+                            }}
+                            if (affiliationSelect) {{
+                                selectedAffiliations = Array.from(affiliationSelect.selectedOptions).map(o => o.value);
+                            }}
+                        }} else {{
+                            if (categorySelect) categorySelect.selectedIndex = -1;
+                            if (affiliationSelect) affiliationSelect.selectedIndex = -1;
+                        }}
+                        
+                        const rows = document.querySelectorAll("table.scoreboard tbody tr[data-team-id]");
+                        rows.forEach(row => {{
+                            const teamId = row.getAttribute("data-team-id");
+                            const meta = teamFilterMetadata[teamId];
+                            
+                            let show = true;
+                            if (selectedCategories.length > 0) {{
+                                if (!meta || !selectedCategories.includes(meta.category)) {{
+                                    show = false;
+                                }}
+                            }}
+                            if (selectedAffiliations.length > 0) {{
+                                if (!meta || !selectedAffiliations.includes(meta.affiliation)) {{
+                                    show = false;
+                                }}
+                            }}
+                            
+                            row.style.display = show ? "" : "none";
+                        }});
+                        
+                        // Update the summaries table row
+                        updateScoreboardSummary();
+                        
+                        // Close the Bootstrap dropdown if active
+                        const dropdownToggle = document.getElementById("filter-toggle");
+                        if (dropdownToggle && typeof bootstrap !== 'undefined' && bootstrap.Dropdown) {{
+                            const dropdown = bootstrap.Dropdown.getOrCreateInstance(dropdownToggle);
+                            dropdown.hide();
+                        }}
+                    }});
+                }});
+            }})();
+            """
+            script = soup.new_tag("script")
+            script.string = js
+            if soup.body:
+                soup.body.append(script)
+            else:
+                soup.append(script)
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -854,7 +1143,7 @@ def main() -> None:
         safe = re.sub(r"[^\w\.-]", "_", domain)
         args.output = f"{safe}_scoreboard.html"
 
-    archiver = BrowserHTMLArchiver(args.url, args.output, verify_ssl=not args.insecure, generate_diagnostics=args.diagnostics)
+    archiver = DOMjudgeScoreboardArchiver(args.url, args.output, verify_ssl=not args.insecure, generate_diagnostics=args.diagnostics)
     archiver.archive()
 
 if __name__ == "__main__":
