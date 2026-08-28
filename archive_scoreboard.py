@@ -646,9 +646,9 @@ class BrowserHTMLArchiver:
         out_path = Path(self.output_path)
         try:
             out_path.write_text(final_html, encoding="utf-8")
-            print(f"✅ Inline HTML written to: {out_path.resolve()}")
+            print(f"[V] Inline HTML written to: {out_path.resolve()}")
         except Exception as exc:
-            print(f"❌ Could not write output file: {exc}", file=sys.stderr)
+            print(f"[ERROR] Could not write output file: {exc}", file=sys.stderr)
             sys.exit(1)
 
         # Now load the offline file in Playwright and compare styles!
@@ -675,6 +675,62 @@ class DOMjudgeScoreboardArchiver(BrowserHTMLArchiver):
     """
     def post_process_html(self, soup: BeautifulSoup, page_url: str) -> None:
         self._inject_offline_ajax_cache(soup, page_url)
+        self._inline_problem_statements(soup, page_url)
+
+    def _inline_problem_statements(self, soup: BeautifulSoup, page_url: str) -> None:
+        """Find all problem statement links in the HTML and inline them as data URIs."""
+        statement_links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if re.search(r"/problems/\d+/statement", href):
+                statement_links.append(a)
+                
+        if not statement_links:
+            return
+
+        # Inject the javascript helper to handle base64-to-blob-URL rendering
+        helper_script = soup.new_tag("script")
+        helper_script.string = """
+        function openOfflineBlob(base64, mimeType) {
+            try {
+                const bin = atob(base64);
+                const len = bin.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) {
+                    bytes[i] = bin.charCodeAt(i);
+                }
+                const blob = new Blob([bytes], {type: mimeType});
+                const url = URL.createObjectURL(blob);
+                window.open(url, '_blank');
+            } catch (e) {
+                console.error("Failed to open offline document:", e);
+                alert("Failed to open document offline.");
+            }
+        }
+        """
+        if soup.body:
+            soup.body.append(helper_script)
+        else:
+            soup.append(helper_script)
+
+        print(f"Found {len(statement_links)} problem statement link(s) to inline.")
+        for a in statement_links:
+            href = a["href"]
+            abs_url = urljoin(page_url, href)
+            try:
+                print(f"Downloading problem statement: {abs_url}")
+                r = requests.get(abs_url, headers=HEADERS, verify=self.verify_ssl, timeout=15)
+                if r.status_code == 200:
+                    content_type = r.headers.get("content-type", "application/pdf").split(";")[0].strip()
+                    encoded = base64.b64encode(r.content).decode("utf-8")
+                    a["href"] = "javascript:void(0)"
+                    a["onclick"] = f"openOfflineBlob('{encoded}', '{content_type}'); return false;"
+                    a["target"] = "_blank"
+                    print(f"[V] Inlined statement for {abs_url} ({content_type})")
+                else:
+                    print(f"[W] Failed to download statement from {abs_url}: Status {r.status_code}")
+            except Exception as e:
+                print(f"[W] Error downloading statement {abs_url}: {e}")
 
     def _inject_offline_ajax_cache(self, soup: BeautifulSoup, page_url: str) -> None:
         """Prefetch all submission JSON data and team modal pages,
