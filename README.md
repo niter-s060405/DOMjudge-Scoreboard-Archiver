@@ -10,3 +10,5 @@ AI-generated program.
 [NTUCPCPC 2026](https://niter-s060405.github.io/DOMjudge-Scoreboard-Archiver/NTUCPCPC-2026.html)
 
 [The 12th NCKU High School Programming Contest Final](https://niter-s060405.github.io/DOMjudge-Scoreboard-Archiver/NCKU-2026.html) ([frozen](https://niter-s060405.github.io/DOMjudge-Scoreboard-Archiver/NCKU-2026-frozen.html))
+
+[TOPC 2026](https://niter-s060405.github.io/DOMjudge-Scoreboard-Archiver/TOPC-2026.html)
