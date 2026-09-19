@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-DOMjudge Scoreboard Archiver – Headless‑Browser version (fixed)
+DOMjudge Scoreboard Archiver – Headless-Browser version (fixed)
 
 This version uses Playwright (Chromium) to render the page, captures all network
 responses, inlines assets, and adds extensive diagnostics to verify that all
 required resources (Bootstrap CSS, team images, CSS order) are captured before
-writing the final self‑contained HTML.
+writing the final self-contained HTML.
 """
 
 import argparse
@@ -15,15 +15,68 @@ import mimetypes
 import os
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Response
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:
+        def __init__(self, iterable=None, total=None, desc="", unit="", **kwargs):
+            self.iterable = iterable
+            self.total = total or (len(iterable) if iterable else 0)
+            self.desc = desc
+            self.unit = unit
+            self.n = 0
+
+        def __iter__(self):
+            for item in self.iterable:
+                yield item
+                self.update(1)
+
+        def update(self, n=1):
+            self.n += n
+            if self.total:
+                pct = int(self.n * 100 / self.total)
+                sys.stdout.write(f"\r{self.desc}: {pct}% ({self.n}/{self.total} {self.unit})")
+                sys.stdout.flush()
+                if self.n >= self.total:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+
+        def close(self):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        @staticmethod
+        def write(s, file=sys.stdout):
+            file.write(f"\r\033[K{s}\n")
+            file.flush()
+
 # ---------------------------------------------------------------------------
-# Helper utilities (same as the pure‑requests version)
+# Helper utilities (same as the pure-requests version)
 # ---------------------------------------------------------------------------
 HEADERS = {
     "User-Agent": (
@@ -34,11 +87,113 @@ HEADERS = {
 }
 
 
+class RateLimiter:
+    """Thread-safe rate limiter (requests per second) using virtual scheduling."""
+    def __init__(self, max_rps: float | None = None):
+        self.max_rps = max_rps if (max_rps and max_rps > 0) else None
+        self.min_interval = 1.0 / self.max_rps if self.max_rps else 0.0
+        self.last_req_time = 0.0
+        self.lock = threading.Lock()
+
+    def acquire(self) -> None:
+        if not self.max_rps:
+            return
+        with self.lock:
+            now = time.monotonic()
+            scheduled_time = max(now, self.last_req_time + self.min_interval)
+            wait = scheduled_time - now
+            self.last_req_time = scheduled_time
+
+        if wait > 0:
+            time.sleep(wait)
+
+
+class RateLimitedSession(requests.Session):
+    """A requests.Session that enforces a RateLimiter and handles timeout retries with backoff."""
+    def __init__(
+        self,
+        rate_limiter: RateLimiter | None = None,
+        timeout: float = 10.0,
+        retry_delay: float = 30.0,
+        max_retries: int = 3,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.rate_limiter = rate_limiter
+        self.default_timeout = timeout
+        self.retry_delay = retry_delay
+        self.max_retries = max_retries
+
+    def send(self, request, **kwargs):
+        if "timeout" not in kwargs or kwargs["timeout"] is None:
+            kwargs["timeout"] = self.default_timeout
+
+        attempts = 0
+        while True:
+            if self.rate_limiter:
+                self.rate_limiter.acquire()
+            try:
+                resp = super().send(request, **kwargs)
+                if resp.status_code in (429, 503) and attempts < self.max_retries:
+                    attempts += 1
+                    tqdm.write(
+                        f"⚠️ [Retry {attempts}/{self.max_retries}] {request.url} returned HTTP {resp.status_code}. "
+                        f"Waiting {self.retry_delay}s until requesting again..."
+                    )
+                    time.sleep(self.retry_delay)
+                    continue
+                return resp
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                attempts += 1
+                if attempts > self.max_retries:
+                    raise
+                reason = "timed out (>10s)" if isinstance(exc, requests.exceptions.Timeout) else f"connection failed ({exc})"
+                tqdm.write(
+                    f"⚠️ [Retry {attempts}/{self.max_retries}] {request.url} {reason}. "
+                    f"Waiting {self.retry_delay}s until requesting again..."
+                )
+                time.sleep(self.retry_delay)
+
+
+def create_session(
+    concurrency: int = 32,
+    verify_ssl: bool = True,
+    rate_limiter: RateLimiter | None = None,
+    timeout: float = 10.0,
+    retry_delay: float = 30.0,
+    max_retries: int = 3,
+) -> requests.Session:
+    """Create a requests.Session with connection pooling, retry strategy, and optional rate limiting and timeout backoff."""
+    session = RateLimitedSession(
+        rate_limiter=rate_limiter,
+        timeout=timeout,
+        retry_delay=retry_delay,
+        max_retries=max_retries,
+    )
+    session.headers.update(HEADERS)
+    session.verify = verify_ssl
+    retry_strategy = Retry(
+        total=max_retries,
+        backoff_factor=0.3,
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        pool_connections=concurrency,
+        pool_maxsize=concurrency,
+        max_retries=retry_strategy,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
 def get_content_type(url: str, server_content_type: str | None = None) -> str:
-    """Return a best‑guess MIME type for *url*.
+    """Return a best-guess MIME type for *url*.
 
     The function first checks the file extension, then falls back to the server's
-    ``Content‑Type`` header and finally ``mimetypes.guess_type``.
+    ``Content-Type`` header and finally ``mimetypes.guess_type``.
     """
     path = url.split("?")[0].split("#")[0].lower()
     ext_map = {
@@ -81,7 +236,18 @@ def to_data_uri(content: bytes, content_type: str) -> str:
 # Main archiver class – uses Playwright to capture the rendered page
 # ---------------------------------------------------------------------------
 class BrowserHTMLArchiver:
-    def __init__(self, start_url: str, output_path: str, verify_ssl: bool = True, generate_diagnostics: bool = False):
+    def __init__(
+        self,
+        start_url: str,
+        output_path: str,
+        verify_ssl: bool = True,
+        generate_diagnostics: bool = False,
+        concurrency: int = 32,
+        rate_limit: float | None = None,
+        timeout: float = 10.0,
+        retry_delay: float = 30.0,
+        max_retries: int = 3,
+    ):
         self.start_url = start_url
         self.output_path = output_path
         self.verify_ssl = verify_ssl
@@ -89,6 +255,12 @@ class BrowserHTMLArchiver:
         # Track if Bootstrap JS is available at runtime
         self.bootstrap_js_present: bool = False
         self.generate_diagnostics = generate_diagnostics
+        self.concurrency = concurrency
+        self.rate_limit = rate_limit
+        self.rate_limiter = RateLimiter(rate_limit)
+        self.timeout = timeout
+        self.retry_delay = retry_delay
+        self.max_retries = max_retries
 
     # ---------------------------------------------------------------------
     # Playwright helpers – capture every network response
@@ -192,10 +364,21 @@ class BrowserHTMLArchiver:
         all_to_fetch = list(missing_img_urls.union(missing_favicon_urls))
 
         if all_to_fetch:
-            print(f"Prefetching {len(all_to_fetch)} missing images/icons in parallel...")
+            max_workers = min(self.concurrency, len(all_to_fetch))
+            rate_info = f", rate_limit={self.rate_limit} req/s" if self.rate_limit else ""
+            print(f"Prefetching {len(all_to_fetch)} missing images/icons in parallel (concurrency={max_workers}{rate_info})...")
+            session = create_session(
+                max_workers,
+                self.verify_ssl,
+                self.rate_limiter,
+                timeout=self.timeout,
+                retry_delay=self.retry_delay,
+                max_retries=self.max_retries,
+            )
+
             def fetch_one(url):
                 try:
-                    r = requests.get(url, headers=HEADERS, verify=self.verify_ssl, timeout=10)
+                    r = session.get(url, timeout=self.timeout)
                     if r.status_code == 200:
                         mime, _ = mimetypes.guess_type(url)
                         if not mime:
@@ -206,15 +389,17 @@ class BrowserHTMLArchiver:
                 except Exception as exc:
                     return url, None, str(exc)
 
-            with ThreadPoolExecutor(max_workers=20) as executor:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {executor.submit(fetch_one, url): url for url in all_to_fetch}
-                for fut in as_completed(futures):
-                    url, content, info = fut.result()
-                    if content is not None:
-                        self.assets[url] = (content, info)
-                        self._log_asset(url, f"{info} (Status: 200)")
-                    else:
-                        print(f"⚠️ Failed to fetch missing asset {url}: {info}")
+                with tqdm(total=len(all_to_fetch), desc="Prefetching missing assets", unit="img") as pbar:
+                    for fut in as_completed(futures):
+                        url, content, info = fut.result()
+                        if content is not None:
+                            self.assets[url] = (content, info)
+                            self._log_asset(url, f"{info} (Status: 200)")
+                        else:
+                            tqdm.write(f"⚠️ Failed to fetch missing asset {url}: {info}")
+                        pbar.update(1)
 
         # Stylesheets (preserve order)
         for link in soup.find_all("link", rel=lambda x: x and "stylesheet" in x):
@@ -251,7 +436,7 @@ class BrowserHTMLArchiver:
             script.string = content.decode("utf-8", errors="ignore")
             # Remove src attribute
             del script["src"]
-            # Re‑apply attributes if they were present
+            # Re-apply attributes if they were present
             if defer:
                 script['defer'] = ''
             if async_attr:
@@ -295,7 +480,7 @@ class BrowserHTMLArchiver:
     # ---------------------------------------------------------------------
     def _inject_modal_helper(self, soup: BeautifulSoup) -> None:
         modal_js = """
-        // Simple bootstrap‑like modal shim (no external CSS/JS needed)
+        // Simple bootstrap-like modal shim (no external CSS/JS needed)
         document.addEventListener('DOMContentLoaded', function () {
             document.querySelectorAll('[data-bs-toggle="modal"]').forEach(function (el) {
                 el.addEventListener('click', function (e) {
@@ -328,7 +513,7 @@ class BrowserHTMLArchiver:
             soup.append(tag)
 
     # ---------------------------------------------------------------------
-    # Post‑processing fixes (modal CSS, etc.)
+    # Post-processing fixes (modal CSS, etc.)
     # ---------------------------------------------------------------------
     def _apply_fixups(self, soup: BeautifulSoup) -> None:
         # 1. Ensure the modal is hidden by default – add minimal CSS rules.
@@ -467,18 +652,41 @@ class BrowserHTMLArchiver:
                         urls_to_fetch.add(resolved_url)
         
         # Now fetch the missing assets using requests
-        for url in urls_to_fetch:
-            try:
-                print(f"Fetching CSS dependency: {url}")
-                r = requests.get(url, headers=HEADERS, verify=self.verify_ssl, timeout=10)
-                if r.status_code == 200:
-                    mime = get_content_type(url, r.headers.get("content-type"))
-                    self.assets[url] = (r.content, mime)
-                    self._log_asset(url, f"{mime} (Status: {r.status_code})")
-                else:
-                    print(f"⚠️ Failed to fetch CSS dependency {url}: Status {r.status_code}")
-            except Exception as e:
-                print(f"⚠️ Error fetching CSS dependency {url}: {e}")
+        if urls_to_fetch:
+            max_workers = min(self.concurrency, len(urls_to_fetch))
+            rate_info = f", rate_limit={self.rate_limit} req/s" if self.rate_limit else ""
+            print(f"Fetching {len(urls_to_fetch)} CSS dependencies in parallel (concurrency={max_workers}{rate_info})...")
+            session = create_session(
+                max_workers,
+                self.verify_ssl,
+                self.rate_limiter,
+                timeout=self.timeout,
+                retry_delay=self.retry_delay,
+                max_retries=self.max_retries,
+            )
+
+            def fetch_css_dep(url):
+                try:
+                    r = session.get(url, timeout=self.timeout)
+                    if r.status_code == 200:
+                        mime = get_content_type(url, r.headers.get("content-type"))
+                        return url, r.content, mime, None
+                    else:
+                        return url, None, None, f"Status {r.status_code}"
+                except Exception as e:
+                    return url, None, None, str(e)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(fetch_css_dep, url): url for url in urls_to_fetch}
+                with tqdm(total=len(urls_to_fetch), desc="Fetching CSS dependencies", unit="file") as pbar:
+                    for fut in as_completed(futures):
+                        url, content, mime, err = fut.result()
+                        if content is not None:
+                            self.assets[url] = (content, mime)
+                            self._log_asset(url, f"{mime} (Status: 200)")
+                        else:
+                            tqdm.write(f"⚠️ Failed to fetch CSS dependency {url}: {err}")
+                        pbar.update(1)
 
     def _log_missing_css_assets(self, soup: BeautifulSoup, page_url: str) -> None:
         """Inspect all inlined CSS for url(...) references that were not captured.
@@ -624,7 +832,7 @@ class BrowserHTMLArchiver:
         # Capture any CSS url(...) or @import dependencies that the browser did not request
         self._capture_css_dependencies(final_url)
 
-        # Parse HTML and run post‑capture diagnostics
+        # Parse HTML and run post-capture diagnostics
         soup = BeautifulSoup(rendered_html, "html.parser")
         if self.generate_diagnostics:
             self._run_diagnostics(soup, final_url)
@@ -674,6 +882,9 @@ class DOMjudgeScoreboardArchiver(BrowserHTMLArchiver):
     adding submission dynamic caching and team category filter handling.
     """
     def post_process_html(self, soup: BeautifulSoup, page_url: str) -> None:
+        # Remove data-ajax-refresh-target to disable background live polling offline
+        for tag in soup.find_all(attrs={"data-ajax-refresh-target": True}):
+            del tag["data-ajax-refresh-target"]
         self._inject_offline_ajax_cache(soup, page_url)
         self._inline_problem_statements(soup, page_url)
 
@@ -713,59 +924,106 @@ class DOMjudgeScoreboardArchiver(BrowserHTMLArchiver):
         else:
             soup.append(helper_script)
 
-        print(f"Found {len(statement_links)} problem statement link(s) to inline.")
-        for a in statement_links:
-            href = a["href"]
-            abs_url = urljoin(page_url, href)
-            try:
-                print(f"Downloading problem statement: {abs_url}")
-                r = requests.get(abs_url, headers=HEADERS, verify=self.verify_ssl, timeout=15)
-                if r.status_code == 200:
-                    content_type = r.headers.get("content-type", "application/pdf").split(";")[0].strip()
-                    encoded = base64.b64encode(r.content).decode("utf-8")
-                    a["href"] = "javascript:void(0)"
-                    a["onclick"] = f"openOfflineBlob('{encoded}', '{content_type}'); return false;"
-                    a["target"] = "_blank"
-                    print(f"[V] Inlined statement for {abs_url} ({content_type})")
-                else:
-                    print(f"[W] Failed to download statement from {abs_url}: Status {r.status_code}")
-            except Exception as e:
-                print(f"[W] Error downloading statement {abs_url}: {e}")
+        if statement_links:
+            max_workers = min(getattr(self, "concurrency", 16), len(statement_links))
+            rate_info = f", rate_limit={self.rate_limit} req/s" if getattr(self, "rate_limit", None) else ""
+            print(f"Found {len(statement_links)} problem statement link(s) to inline (concurrency={max_workers}{rate_info}).")
+            session = create_session(
+                max_workers,
+                self.verify_ssl,
+                getattr(self, "rate_limiter", None),
+                timeout=getattr(self, "timeout", 10.0),
+                retry_delay=getattr(self, "retry_delay", 30.0),
+                max_retries=getattr(self, "max_retries", 3),
+            )
+
+            def fetch_statement(a_tag):
+                href = a_tag["href"]
+                abs_url = urljoin(page_url, href)
+                try:
+                    r = session.get(abs_url, timeout=getattr(self, "timeout", 10.0))
+                    if r.status_code == 200:
+                        content_type = r.headers.get("content-type", "application/pdf").split(";")[0].strip()
+                        encoded = base64.b64encode(r.content).decode("utf-8")
+                        return a_tag, abs_url, encoded, content_type, None
+                    else:
+                        return a_tag, abs_url, None, None, f"Status {r.status_code}"
+                except Exception as e:
+                    return a_tag, abs_url, None, None, str(e)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(fetch_statement, a): a for a in statement_links}
+                with tqdm(total=len(statement_links), desc="Inlining problem statements", unit="doc") as pbar:
+                    for fut in as_completed(futures):
+                        a_tag, abs_url, encoded, content_type, err = fut.result()
+                        if encoded:
+                            a_tag["href"] = "javascript:void(0)"
+                            a_tag["onclick"] = f"openOfflineBlob('{encoded}', '{content_type}'); return false;"
+                            a_tag["target"] = "_blank"
+                            tqdm.write(f"[V] Inlined statement for {abs_url} ({content_type})")
+                        else:
+                            tqdm.write(f"[W] Failed to download statement from {abs_url}: {err}")
+                        pbar.update(1)
 
     def _inject_offline_ajax_cache(self, soup: BeautifulSoup, page_url: str) -> None:
         """Prefetch all submission JSON data and team modal pages,
         and inject them as a static cache to mock window.fetch and jQuery.ajax.
         """
         ajax_cache = {}
+        max_workers = getattr(self, "concurrency", 32)
+        rate_info = f", rate_limit={self.rate_limit} req/s" if getattr(self, "rate_limit", None) else ""
+        cur_timeout = getattr(self, "timeout", 10.0)
+        session = create_session(
+            max_workers,
+            self.verify_ssl,
+            getattr(self, "rate_limiter", None),
+            timeout=cur_timeout,
+            retry_delay=getattr(self, "retry_delay", 30.0),
+            max_retries=getattr(self, "max_retries", 3),
+        )
         
         # 1. Fetch submission data URLs
         sub_tags = soup.find_all(attrs={"data-submissions-url": True})
         sub_urls = sorted(list(set(tag.get("data-submissions-url") for tag in sub_tags if tag.get("data-submissions-url"))))
         
         if sub_urls:
-            print(f"Prefetching {len(sub_urls)} submissions data URLs...")
-            for sub_url in sub_urls:
+            cur_workers = min(max_workers, len(sub_urls))
+            print(f"Prefetching {len(sub_urls)} submissions data URLs (concurrency={cur_workers}{rate_info})...")
+
+            def fetch_sub(sub_url: str):
                 abs_url = urljoin(page_url, sub_url)
                 try:
-                    r = requests.get(abs_url, headers=HEADERS, verify=self.verify_ssl, timeout=10)
+                    r = session.get(abs_url, timeout=cur_timeout)
                     if r.status_code == 200:
-                        ajax_cache[sub_url] = r.text
+                        return sub_url, r.text
                     else:
-                        print(f"⚠️ Submissions endpoint {sub_url} returned status {r.status_code}")
+                        tqdm.write(f"⚠️ Submissions endpoint {sub_url} returned status {r.status_code}")
                 except Exception as exc:
-                    print(f"⚠️ Error fetching submissions data {sub_url}: {exc}")
+                    tqdm.write(f"⚠️ Error fetching submissions data {sub_url}: {exc}")
+                return sub_url, None
+
+            with ThreadPoolExecutor(max_workers=cur_workers) as executor:
+                futures = {executor.submit(fetch_sub, u): u for u in sub_urls}
+                with tqdm(total=len(sub_urls), desc="Prefetching submissions data", unit="req") as pbar:
+                    for fut in as_completed(futures):
+                        sub_url, res = fut.result()
+                        if res is not None:
+                            ajax_cache[sub_url] = res
+                        pbar.update(1)
         
         # 2. Fetch team modal pages
         team_tags = soup.find_all('a', attrs={"data-ajax-modal": True})
         team_urls = sorted(list(set(tag.get("href") for tag in team_tags if tag.get("href"))))
         
         if team_urls:
-            print(f"Prefetching {len(team_urls)} team modal pages...")
-            for team_url in team_urls:
+            cur_workers = min(max_workers, len(team_urls))
+            print(f"Prefetching {len(team_urls)} team modal pages (concurrency={cur_workers}{rate_info})...")
+
+            def fetch_team(team_url: str):
                 abs_url = urljoin(page_url, team_url)
                 try:
-                    headers = {**HEADERS, "X-Requested-With": "XMLHttpRequest"}
-                    r = requests.get(abs_url, headers=headers, verify=self.verify_ssl, timeout=10)
+                    headers = {"X-Requested-With": "XMLHttpRequest"}
+                    r = session.get(abs_url, headers=headers, timeout=cur_timeout)
                     if r.status_code == 200:
                         modal_soup = BeautifulSoup(r.text, "html.parser")
                         for s_tag in modal_soup.find_all("script"):
@@ -777,7 +1035,7 @@ class DOMjudgeScoreboardArchiver(BrowserHTMLArchiver):
                                 continue
                             abs_img_url = urljoin(abs_url, img_src)
                             try:
-                                r_img = requests.get(abs_img_url, headers=HEADERS, verify=self.verify_ssl, timeout=10)
+                                r_img = session.get(abs_img_url, timeout=cur_timeout)
                                 if r_img.status_code == 200:
                                     mime, _ = mimetypes.guess_type(abs_img_url)
                                     if not mime:
@@ -785,19 +1043,29 @@ class DOMjudgeScoreboardArchiver(BrowserHTMLArchiver):
                                     img_data = base64.b64encode(r_img.content).decode("utf-8")
                                     img_tag["src"] = f"data:{mime};base64,{img_data}"
                                 else:
-                                    print(f"⚠️ Failed to fetch modal image {abs_img_url}: Status {r_img.status_code}")
+                                    tqdm.write(f"⚠️ Failed to fetch modal image {abs_img_url}: Status {r_img.status_code}")
                             except Exception as exc:
-                                print(f"⚠️ Error fetching modal image {abs_img_url}: {exc}")
+                                tqdm.write(f"⚠️ Error fetching modal image {abs_img_url}: {exc}")
                         # Extract only the main modal div (or root div) to avoid leading/trailing whitespace text nodes
                         modal_div = modal_soup.find("div", class_="modal") or modal_soup.find("div")
                         if modal_div:
-                            ajax_cache[team_url] = str(modal_div).strip()
+                            return team_url, str(modal_div).strip()
                         else:
-                            ajax_cache[team_url] = r.text.strip()
+                            return team_url, r.text.strip()
                     else:
-                        print(f"⚠️ Team modal endpoint {team_url} returned status {r.status_code}")
+                        tqdm.write(f"⚠️ Team modal endpoint {team_url} returned status {r.status_code}")
                 except Exception as exc:
-                    print(f"⚠️ Error fetching team page {team_url}: {exc}")
+                    tqdm.write(f"⚠️ Error fetching team page {team_url}: {exc}")
+                return team_url, None
+
+            with ThreadPoolExecutor(max_workers=cur_workers) as executor:
+                futures = {executor.submit(fetch_team, u): u for u in team_urls}
+                with tqdm(total=len(team_urls), desc="Prefetching team modals", unit="modal") as pbar:
+                    for fut in as_completed(futures):
+                        team_url, res = fut.result()
+                        if res is not None:
+                            ajax_cache[team_url] = res
+                        pbar.update(1)
                     
         # 3. Inject JS mockup script
         if not ajax_cache:
@@ -898,17 +1166,23 @@ class DOMjudgeScoreboardArchiver(BrowserHTMLArchiver):
     def _setup_offline_filter(self, soup: BeautifulSoup, page_url: str, dynamic_team_pages: dict) -> None:
         """Parse category/affiliation mappings for teams and inject the offline filter JS.
         """
-        filter_options = {}
+        category_options = {}
+        affiliation_options = {}
         for select in soup.find_all("select"):
-            select_id = select.get("id")
-            if not select_id or "filter" not in select_id:
-                continue
-            filter_options[select_id] = {}
-            for option in select.find_all("option"):
-                val = option.get("value")
-                text = option.get_text(strip=True)
-                if val:
-                    filter_options[select_id][text] = val
+            s_id = (select.get("id") or "").lower()
+            s_name = (select.get("name") or "").lower()
+            target_map = None
+            if "category" in s_id or "categor" in s_name or "category" in s_name:
+                target_map = category_options
+            elif "affil" in s_id or "affil" in s_name:
+                target_map = affiliation_options
+            
+            if target_map is not None:
+                for option in select.find_all("option"):
+                    val = option.get("value")
+                    text = option.get_text(strip=True)
+                    if val and text:
+                        target_map[text] = str(val)
 
         team_filter_metadata = {}
 
@@ -929,22 +1203,20 @@ class DOMjudgeScoreboardArchiver(BrowserHTMLArchiver):
 
         # 1. Extract from dynamically fetched team modal pages
         for team_url, html_content in dynamic_team_pages.items():
-            match = re.search(r"/team/(\d+)", team_url)
-            if not match:
+            if "/submissions-data/" in team_url:
+                continue
+            match = re.search(r"/team/(\d+)(?:[/?#]|$)", team_url)
+            if not match or not html_content or html_content.startswith("{"):
                 continue
             team_id = match.group(1)
             modal_soup = BeautifulSoup(html_content, "html.parser")
             cat_name, aff_name = parse_modal_details(modal_soup)
             
             meta = {}
-            if cat_name and "scoreboard-filter-category" in filter_options:
-                opt_val = filter_options["scoreboard-filter-category"].get(cat_name)
-                if opt_val:
-                    meta["category"] = opt_val
-            if aff_name and "scoreboard-filter-affiliation" in filter_options:
-                opt_val = filter_options["scoreboard-filter-affiliation"].get(aff_name)
-                if opt_val:
-                    meta["affiliation"] = opt_val
+            if cat_name and cat_name in category_options:
+                meta["category"] = category_options[cat_name]
+            if aff_name and aff_name in affiliation_options:
+                meta["affiliation"] = affiliation_options[aff_name]
             if meta:
                 team_filter_metadata[team_id] = meta
 
@@ -955,20 +1227,29 @@ class DOMjudgeScoreboardArchiver(BrowserHTMLArchiver):
             cat_name, aff_name = parse_modal_details(modal)
             
             meta = {}
-            if cat_name and "scoreboard-filter-category" in filter_options:
-                opt_val = filter_options["scoreboard-filter-category"].get(cat_name)
-                if opt_val:
-                    meta["category"] = opt_val
-            if aff_name and "scoreboard-filter-affiliation" in filter_options:
-                opt_val = filter_options["scoreboard-filter-affiliation"].get(aff_name)
-                if opt_val:
-                    meta["affiliation"] = opt_val
+            if cat_name and cat_name in category_options:
+                meta["category"] = category_options[cat_name]
+            if aff_name and aff_name in affiliation_options:
+                meta["affiliation"] = affiliation_options[aff_name]
             if meta:
                 if team_id not in team_filter_metadata:
                     team_filter_metadata[team_id] = {}
                 team_filter_metadata[team_id].update(meta)
 
-        if team_filter_metadata or filter_options:
+        # 3. Fallback extraction directly from scoreboard table rows
+        for tr in soup.find_all("tr", attrs={"data-team-id": True}):
+            team_id = tr.get("data-team-id")
+            if not team_id:
+                continue
+            meta = team_filter_metadata.setdefault(team_id, {})
+            if "affiliation" not in meta:
+                univ_span = tr.find(class_="univ")
+                if univ_span:
+                    aff_text = univ_span.get_text(strip=True)
+                    if aff_text in affiliation_options:
+                        meta["affiliation"] = affiliation_options[aff_text]
+
+        if team_filter_metadata or category_options or affiliation_options:
             js = f"""
             (function() {{
                 const teamFilterMetadata = {json.dumps(team_filter_metadata)};
@@ -1100,65 +1381,109 @@ class DOMjudgeScoreboardArchiver(BrowserHTMLArchiver):
                     }});
                 }}
 
-                document.addEventListener("DOMContentLoaded", function() {{
-                    const filterForm = document.querySelector(".filterbox form") || document.querySelector("form");
+                function initOfflineFilter() {{
+                    const filterForm = document.querySelector(".filterbox")?.closest("form") || 
+                                       document.querySelector("form:has(.filterbox)") || 
+                                       document.querySelector(".filterbox") || 
+                                       document.querySelector("form");
                     if (!filterForm) return;
-                    
-                    filterForm.addEventListener("submit", function(e) {{
-                        e.preventDefault();
-                        
-                        const submitter = e.submitter || document.activeElement;
-                        const isClear = submitter && submitter.value === "clear";
-                        
-                        const categorySelect = document.getElementById("scoreboard-filter-category");
-                        const affiliationSelect = document.getElementById("scoreboard-filter-affiliation");
-                        
-                        let selectedCategories = [];
-                        let selectedAffiliations = [];
-                        
-                        if (!isClear) {{
+
+                    const categorySelect = document.getElementById("scoreboard-filter-category") || 
+                                           document.querySelector("select[name*='categor']");
+                    const affiliationSelect = document.getElementById("scoreboard-filter-affil") || 
+                                              document.getElementById("scoreboard-filter-affiliation") || 
+                                              document.querySelector("select[name*='affil']");
+
+                    let lastClickedAction = "filter";
+                    filterForm.querySelectorAll("input[type='submit'], button[type='submit']").forEach(btn => {{
+                        btn.addEventListener("click", function(e) {{
+                            lastClickedAction = (this.value || this.name || "").toLowerCase();
+                        }});
+                    }});
+
+                    function applyFilter(isClear) {{
+                        if (isClear) {{
                             if (categorySelect) {{
-                                selectedCategories = Array.from(categorySelect.selectedOptions).map(o => o.value);
+                                Array.from(categorySelect.options).forEach(o => o.selected = false);
                             }}
                             if (affiliationSelect) {{
-                                selectedAffiliations = Array.from(affiliationSelect.selectedOptions).map(o => o.value);
+                                Array.from(affiliationSelect.options).forEach(o => o.selected = false);
                             }}
-                        }} else {{
-                            if (categorySelect) categorySelect.selectedIndex = -1;
-                            if (affiliationSelect) affiliationSelect.selectedIndex = -1;
                         }}
-                        
+
+                        const selectedCategories = (categorySelect && !isClear)
+                            ? Array.from(categorySelect.selectedOptions).map(o => String(o.value))
+                            : [];
+                        const selectedAffiliations = (affiliationSelect && !isClear)
+                            ? Array.from(affiliationSelect.selectedOptions).map(o => String(o.value))
+                            : [];
+
                         const rows = document.querySelectorAll("table.scoreboard tbody tr[data-team-id]");
                         rows.forEach(row => {{
                             const teamId = row.getAttribute("data-team-id");
                             const meta = teamFilterMetadata[teamId];
-                            
+
                             let show = true;
                             if (selectedCategories.length > 0) {{
-                                if (!meta || !selectedCategories.includes(meta.category)) {{
+                                if (!meta || !selectedCategories.includes(String(meta.category))) {{
                                     show = false;
                                 }}
                             }}
                             if (selectedAffiliations.length > 0) {{
-                                if (!meta || !selectedAffiliations.includes(meta.affiliation)) {{
+                                if (!meta || !selectedAffiliations.includes(String(meta.affiliation))) {{
                                     show = false;
                                 }}
                             }}
-                            
+
                             row.style.display = show ? "" : "none";
                         }});
-                        
-                        // Update the summaries table row
+
                         updateScoreboardSummary();
-                        
-                        // Close the Bootstrap dropdown if active
+
+                        // Close dropdown
                         const dropdownToggle = document.getElementById("filter-toggle");
                         if (dropdownToggle && typeof bootstrap !== 'undefined' && bootstrap.Dropdown) {{
-                            const dropdown = bootstrap.Dropdown.getOrCreateInstance(dropdownToggle);
-                            dropdown.hide();
+                            try {{
+                                const dropdown = bootstrap.Dropdown.getOrCreateInstance(dropdownToggle);
+                                dropdown.hide();
+                            }} catch(e) {{}}
                         }}
+                        const dropdownMenu = filterForm.closest(".dropdown-menu") || document.querySelector(".dropdown-menu.show");
+                        if (dropdownMenu) {{
+                            dropdownMenu.classList.remove("show");
+                        }}
+                        if (dropdownToggle) {{
+                            dropdownToggle.classList.remove("show");
+                            dropdownToggle.setAttribute("aria-expanded", "false");
+                        }}
+                    }}
+
+                    filterForm.addEventListener("submit", function(e) {{
+                        e.preventDefault();
+                        e.stopPropagation();
+                        const submitter = e.submitter || document.activeElement;
+                        const action = (submitter && (submitter.value || submitter.name || "").toLowerCase()) || lastClickedAction;
+                        const isClear = action === "clear";
+                        applyFilter(isClear);
+                        return false;
                     }});
-                }});
+
+                    const clearBtn = filterForm.querySelector("input[value='clear'], button[value='clear'], input[name='clear'], button[name='clear']");
+                    if (clearBtn) {{
+                        clearBtn.addEventListener("click", function(e) {{
+                            e.preventDefault();
+                            e.stopPropagation();
+                            applyFilter(true);
+                            return false;
+                        }});
+                    }}
+                }}
+
+                if (document.readyState === "loading") {{
+                    document.addEventListener("DOMContentLoaded", initOfflineFilter);
+                }} else {{
+                    initOfflineFilter();
+                }}
             }})();
             """
             script = soup.new_tag("script")
@@ -1174,7 +1499,7 @@ class DOMjudgeScoreboardArchiver(BrowserHTMLArchiver):
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Archive a DOMjudge scoreboard using a headless browser, producing a single fully‑inlined HTML file."
+        description="Archive a DOMjudge scoreboard using a headless browser, producing a single fully-inlined HTML file."
     )
     parser.add_argument("--url", required=True, help="Scoreboard URL (e.g. https://taichung2025.icpc.tw/)")
     parser.add_argument(
@@ -1191,6 +1516,38 @@ def main() -> None:
         action="store_true",
         help="Generate a diagnostics log and verify the offline layout in Playwright",
     )
+    parser.add_argument(
+        "--concurrency",
+        "-c",
+        type=int,
+        default=32,
+        help="Number of concurrent threads for network prefetching (default: 32)",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        "--rps",
+        type=float,
+        default=None,
+        help="Maximum requests per second limit (e.g. 20 for 20 req/s, default: unlimited)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=5.0,
+        help="Request timeout in seconds before waiting to retry (default: 5.0)",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=5.0,
+        help="Seconds to wait before retrying a timed-out request (default: 5.0)",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=999999,
+        help="Maximum number of retries for timed-out requests (default: 999999)",
+    )
     args = parser.parse_args()
 
     if not args.output:
@@ -1199,7 +1556,17 @@ def main() -> None:
         safe = re.sub(r"[^\w\.-]", "_", domain)
         args.output = f"{safe}_scoreboard.html"
 
-    archiver = DOMjudgeScoreboardArchiver(args.url, args.output, verify_ssl=not args.insecure, generate_diagnostics=args.diagnostics)
+    archiver = DOMjudgeScoreboardArchiver(
+        args.url,
+        args.output,
+        verify_ssl=not args.insecure,
+        generate_diagnostics=args.diagnostics,
+        concurrency=args.concurrency,
+        rate_limit=args.rate_limit,
+        timeout=args.timeout,
+        retry_delay=args.retry_delay,
+        max_retries=args.max_retries,
+    )
     archiver.archive()
 
 if __name__ == "__main__":
