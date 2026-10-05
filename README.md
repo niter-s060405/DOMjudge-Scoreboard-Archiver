@@ -1,5 +1,5 @@
 # DOMjudge-Scoreboard-Archiver
-AI-generated program.
+A collection of DOMjudge scoreboards.
 
 ## Collections
 
